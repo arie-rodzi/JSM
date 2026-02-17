@@ -103,8 +103,17 @@ def connect_db():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
-def ensure_tables(conn: sqlite3.Connection):
+def ensure_tables(conn: sqlite3.Connection, force_recreate: bool = False):
+    """
+    IMPORTANT: if force_recreate=True, drops tables so schema updates won't crash.
+    """
     cur = conn.cursor()
+
+    if force_recreate:
+        cur.execute("DROP TABLE IF EXISTS ms_master")
+        cur.execute("DROP TABLE IF EXISTS nsc_directory")
+        conn.commit()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS ms_master (
@@ -121,7 +130,6 @@ def ensure_tables(conn: sqlite3.Connection):
             nsc_name TEXT,
             ms_new_old_number TEXT,
 
-            -- NEW: mandatory/voluntary + agency/regulator info
             compliance_type TEXT,
             agency TEXT,
             refer TEXT,
@@ -131,7 +139,6 @@ def ensure_tables(conn: sqlite3.Connection):
             date_of_enforcement TEXT,
             remarks_new_version TEXT,
 
-            -- internal matching key
             ms_key TEXT,
             ms_old_key TEXT
         )
@@ -203,8 +210,11 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
             mand["ms_key"] = mand["No. of MS"].apply(canonical_ms_code)
             mand = mand[mand["ms_key"] != ""].copy()
 
-            # Normalize possible weird regulation column name
-            reg_col = "Regulation \n" if "Regulation \n" in mand.columns else ("Regulation" if "Regulation" in mand.columns else None)
+            reg_col = (
+                "Regulation \n"
+                if "Regulation \n" in mand.columns
+                else ("Regulation" if "Regulation" in mand.columns else None)
+            )
 
             mand_out = pd.DataFrame(
                 {
@@ -226,7 +236,6 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
             mand_out2 = mand_out.rename(columns={"ms_key": "ms_old_key"})
             merged2 = merged1.merge(mand_out2, on="ms_old_key", how="left", suffixes=("", "_old"))
 
-            # Combine: prefer direct match, else old match
             def coalesce(a, b):
                 return a.where(a.notna(), b)
 
@@ -261,12 +270,6 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
             master["date_of_enforcement"] = merged2["date_of_enforcement_final"]
             master["remarks_new_version"] = merged2["remarks_new_version_final"]
 
-    # Replace tables
-    cur = conn.cursor()
-    cur.execute("DELETE FROM ms_master")
-    cur.execute("DELETE FROM nsc_directory")
-    conn.commit()
-
     master_out = pd.DataFrame(
         {
             "row_id": master["row_id"],
@@ -295,7 +298,7 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
     )
     master_out.to_sql("ms_master", conn, if_exists="append", index=False)
 
-    # Insert NSC directory (if present)
+    # Insert NSC directory
     if "NSC" in nsc_dir.columns:
         nsc_dir = nsc_dir.copy()
         nsc_dir["nsc_code"] = nsc_dir["NSC"].apply(lambda s: parse_nsc(s)[0] if pd.notna(s) else None)
@@ -322,7 +325,7 @@ def db_has_data() -> bool:
         return False
     conn = connect_db()
     try:
-        ensure_tables(conn)
+        ensure_tables(conn, force_recreate=False)
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM ms_master")
         n = cur.fetchone()[0]
@@ -369,17 +372,32 @@ with st.sidebar:
     with col_a:
         do_refresh = st.button("Refresh DB", use_container_width=True, disabled=(uploaded_master is None))
     with col_b:
-        reset = st.button("Reset App Cache", use_container_width=True)
+        reset_cache = st.button("Reset App Cache", use_container_width=True)
 
-    if reset:
+    st.divider()
+    st.caption("Troubleshooting (schema changes)")
+    hard_reset = st.button("Hard Reset DB (Drop tables)", use_container_width=True)
+
+    if reset_cache:
         st.cache_data.clear()
         st.toast("Cache cleared.", icon="✅")
 
-conn = connect_db()
-ensure_tables(conn)
 
+conn = connect_db()
+
+# If user clicks hard reset
+if hard_reset:
+    ensure_tables(conn, force_recreate=True)
+    st.cache_data.clear()
+    st.success("Database schema reset. Now upload Excel(s) and click Refresh DB.")
+
+# Normal ensure (no drop)
+ensure_tables(conn, force_recreate=False)
+
+# Refresh DB flow (DROP+RECREATE to avoid schema mismatch)
 if do_refresh and uploaded_master is not None:
     with st.spinner("Importing Excel into local database..."):
+        ensure_tables(conn, force_recreate=True)  # IMPORTANT: avoids sqlite missing-column errors
         load_excel_to_db(uploaded_master, conn, mandatory_excel_file=uploaded_mand)
         st.cache_data.clear()
     st.success("Database refreshed from uploaded Excel(s).")
@@ -416,7 +434,6 @@ with c4:
 
 with c5:
     agency_opts = sorted([a for a in master["agency"].fillna("Unknown").unique().tolist()])
-    # Put real agencies first, keep Unknown last
     agency_opts = [a for a in agency_opts if a != "Unknown"] + (["Unknown"] if "Unknown" in agency_opts else [])
     agency_sel = st.multiselect("Filter by Agency", options=agency_opts, default=[])
 
@@ -516,7 +533,6 @@ with st.expander("NSC Directory (Project Manager / Contacts)", expanded=False):
 # Data Table + Optional Editing
 # -----------------------------
 st.subheader("Data Table")
-
 edit_mode = st.toggle("Enable edit mode (Update MS Status)", value=False)
 
 display_cols = [
