@@ -33,22 +33,25 @@ def parse_nsc(nsc_text: str):
 def canonical_ms_code(x) -> str:
     """
     Robust MS key extraction from messy strings (both master & mandatory files).
-    Example -> 'MS 1040:1986', 'MS 1742-2:2004', 'MS IEC 61851-21-1:2021'
+    Returns a comparable key like:
+      'MS 1040:1986', 'MS 1742-2:2004', 'MS IEC 61851-21-1:2021', 'MS ISO 9001:2015'
     """
     if pd.isna(x):
         return ""
     raw = str(x).upper().strip()
 
-    # remove bracketed notes
+    # remove parentheses notes
     raw = re.sub(r"\(.*?\)", "", raw)
+
+    # normalize whitespace/punct
     raw = raw.replace(",", " ")
     raw = re.sub(r"\s+", " ", raw)
     raw = re.sub(r"\s*-\s*", "-", raw)
     raw = re.sub(r"\s*:\s*", ":", raw)
 
-    # Capture starting from MS up to a year (optional)
-    # Allows prefixes like "MS IEC", "MS ISO/IEC", etc.
-    pat = r"\bMS\b\s*(?:[A-Z/\.]{2,20}\s+)*[0-9A-Z][0-9A-Z./-]*(?:-[0-9A-Z./-]+)*(:\d{4})?"
+    # Grab from "MS" onwards including optional prefix words (ISO/IEC/EN etc)
+    # then numbers/letters, optional hyphen sections, optional year
+    pat = r"\bMS\b\s*(?:[A-Z/\.]{2,30}\s+)*[0-9A-Z][0-9A-Z./-]*(?:-[0-9A-Z./-]+)*(:\d{4})?"
     m = re.search(pat, raw)
     if not m:
         return ""
@@ -57,7 +60,7 @@ def canonical_ms_code(x) -> str:
     code = re.sub(r"\bMS\b\s*", "MS ", code).strip()
     code = re.sub(r"\s+", " ", code)
 
-    # If year missing in captured code but appears later in raw, append it
+    # If year isn't captured but exists later, append it
     if not re.search(r":\d{4}\b", code):
         y = re.search(r":(\d{4})\b", raw)
         if y:
@@ -73,7 +76,7 @@ def safe_get(df: pd.DataFrame, col: str):
 def read_mandatory_sheet(excel_file) -> pd.DataFrame:
     """
     Auto-detect the sheet in mandatory file that contains 'No. of MS' column.
-    Also strips all column names.
+    Strips all column names.
     """
     try:
         xls = pd.ExcelFile(excel_file)
@@ -95,7 +98,8 @@ def read_mandatory_sheet(excel_file) -> pd.DataFrame:
         return pd.DataFrame()
 
     mand = pd.read_excel(excel_file, sheet_name=target)
-    mand.columns = [str(c).strip() for c in mand.columns]  # IMPORTANT
+    mand.columns = [str(c).strip() for c in mand.columns]
+    mand["_sheet_used"] = target  # for debugging
     return mand
 
 
@@ -105,7 +109,8 @@ def connect_db():
 
 def ensure_tables(conn: sqlite3.Connection, force_recreate: bool = False):
     """
-    IMPORTANT: if force_recreate=True, drops tables so schema updates won't crash.
+    IMPORTANT:
+    - force_recreate=True will DROP tables to avoid schema mismatch errors.
     """
     cur = conn.cursor()
 
@@ -144,6 +149,7 @@ def ensure_tables(conn: sqlite3.Connection, force_recreate: bool = False):
         )
         """
     )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS nsc_directory (
@@ -156,12 +162,56 @@ def ensure_tables(conn: sqlite3.Connection, force_recreate: bool = False):
         )
         """
     )
+
     conn.commit()
+
+
+def get_import_debug(master_excel_file, mandatory_excel_file=None):
+    """
+    Calculate match estimates BEFORE writing into DB (to diagnose '589 becomes 8').
+    """
+    master = pd.read_excel(master_excel_file, sheet_name=DEFAULT_SHEET_MASTER)
+    master_key = master.get("MS NUMBER")
+    if master_key is None:
+        master_key = pd.Series([""] * len(master))
+    master_key = master_key.apply(canonical_ms_code)
+    master_set = set([k for k in master_key.unique() if k])
+
+    out = {
+        "master_rows": int(master.shape[0]),
+        "master_unique_mskey": int(len(master_set)),
+        "mandatory_rows": 0,
+        "mandatory_unique_mskey": 0,
+        "matched_unique_mskey_estimate": 0,
+        "matched_rows_estimate": 0,
+        "mandatory_sheet_used": None,
+    }
+
+    if mandatory_excel_file is None:
+        return out
+
+    mand = read_mandatory_sheet(mandatory_excel_file)
+    if mand.empty or ("No. of MS" not in mand.columns):
+        return out
+
+    out["mandatory_sheet_used"] = str(mand["_sheet_used"].iloc[0]) if "_sheet_used" in mand.columns and len(mand) else None
+
+    mand_key = mand["No. of MS"].apply(canonical_ms_code)
+    mand_key = mand_key[mand_key != ""]
+    mand_set = set(mand_key.unique())
+
+    out["mandatory_rows"] = int(mand.shape[0])
+    out["mandatory_unique_mskey"] = int(len(mand_set))
+
+    out["matched_unique_mskey_estimate"] = int(len(master_set & mand_set))
+    out["matched_rows_estimate"] = int(master_key.isin(mand_set).sum())
+
+    return out
 
 
 def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_excel_file=None):
     """
-    Ingest master Excel + optional mandatory Excel into SQLite, replacing existing data.
+    Ingest master Excel + optional mandatory Excel into SQLite (tables already recreated).
     """
     master = pd.read_excel(master_excel_file, sheet_name=DEFAULT_SHEET_MASTER)
     nsc_dir = pd.read_excel(master_excel_file, sheet_name=DEFAULT_SHEET_NSC)
@@ -210,6 +260,7 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
             mand["ms_key"] = mand["No. of MS"].apply(canonical_ms_code)
             mand = mand[mand["ms_key"] != ""].copy()
 
+            # normalize possible weird regulation column name
             reg_col = (
                 "Regulation \n"
                 if "Regulation \n" in mand.columns
@@ -270,6 +321,7 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
             master["date_of_enforcement"] = merged2["date_of_enforcement_final"]
             master["remarks_new_version"] = merged2["remarks_new_version_final"]
 
+    # Write master table
     master_out = pd.DataFrame(
         {
             "row_id": master["row_id"],
@@ -298,7 +350,7 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
     )
     master_out.to_sql("ms_master", conn, if_exists="append", index=False)
 
-    # Insert NSC directory
+    # Write NSC directory
     if "NSC" in nsc_dir.columns:
         nsc_dir = nsc_dir.copy()
         nsc_dir["nsc_code"] = nsc_dir["NSC"].apply(lambda s: parse_nsc(s)[0] if pd.notna(s) else None)
@@ -375,32 +427,45 @@ with st.sidebar:
         reset_cache = st.button("Reset App Cache", use_container_width=True)
 
     st.divider()
-    st.caption("Troubleshooting (schema changes)")
+    st.caption("Schema / DB reset")
     hard_reset = st.button("Hard Reset DB (Drop tables)", use_container_width=True)
 
     if reset_cache:
         st.cache_data.clear()
         st.toast("Cache cleared.", icon="✅")
 
-
 conn = connect_db()
 
-# If user clicks hard reset
 if hard_reset:
     ensure_tables(conn, force_recreate=True)
     st.cache_data.clear()
-    st.success("Database schema reset. Now upload Excel(s) and click Refresh DB.")
+    st.success("DB reset done. Now upload Excel(s) and click Refresh DB.")
 
-# Normal ensure (no drop)
+# ensure tables exist (no drop)
 ensure_tables(conn, force_recreate=False)
 
-# Refresh DB flow (DROP+RECREATE to avoid schema mismatch)
+# Refresh flow: ALWAYS drop & recreate to prevent schema mismatch
 if do_refresh and uploaded_master is not None:
     with st.spinner("Importing Excel into local database..."):
-        ensure_tables(conn, force_recreate=True)  # IMPORTANT: avoids sqlite missing-column errors
+        ensure_tables(conn, force_recreate=True)  # critical
+
+        debug = get_import_debug(uploaded_master, uploaded_mand)
+
         load_excel_to_db(uploaded_master, conn, mandatory_excel_file=uploaded_mand)
         st.cache_data.clear()
+
     st.success("Database refreshed from uploaded Excel(s).")
+
+    # Debug info: tells you if 589 becomes 8 due to matching
+    st.info(
+        f"Import Debug ✅ | Master rows: {debug['master_rows']:,} | "
+        f"Master unique MS keys: {debug['master_unique_mskey']:,} | "
+        f"Mandatory rows: {debug['mandatory_rows']:,} | "
+        f"Mandatory unique MS keys: {debug['mandatory_unique_mskey']:,} | "
+        f"Matched unique MS (estimate): {debug['matched_unique_mskey_estimate']:,} | "
+        f"Matched rows (estimate): {debug['matched_rows_estimate']:,} | "
+        f"Mandatory sheet used: {debug['mandatory_sheet_used']}"
+    )
 
 if not db_has_data():
     st.warning("No data in the dashboard database yet. Upload Master List and click **Refresh DB**.")
@@ -433,8 +498,10 @@ with c4:
     comp_sel = st.multiselect("Mandatory / Voluntary", options=comp_opts, default=[])
 
 with c5:
-    agency_opts = sorted([a for a in master["agency"].fillna("Unknown").unique().tolist()])
-    agency_opts = [a for a in agency_opts if a != "Unknown"] + (["Unknown"] if "Unknown" in agency_opts else [])
+    # show all REAL agencies (exclude Unknown/empty by default)
+    agency_series = master["agency"].dropna().astype(str).str.strip()
+    agency_series = agency_series[agency_series != ""]
+    agency_opts = sorted(agency_series.unique().tolist())
     agency_sel = st.multiselect("Filter by Agency", options=agency_opts, default=[])
 
 with c6:
@@ -469,13 +536,14 @@ if search.strip():
 # KPIs
 # -----------------------------
 st.subheader("Key Metrics")
-k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
+k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
 
 total_all = int(master.shape[0])
 total_filtered = int(filtered.shape[0])
 unique_ms_all = int(master["ms_number"].nunique())
 unique_ms_filtered = int(filtered["ms_number"].nunique())
 unique_type_filtered = int(filtered["type_of_ms"].nunique())
+mandatory_all = int((master["compliance_type"].fillna("Voluntary") == "Mandatory").sum())
 mandatory_filtered = int((filtered["compliance_type"] == "Mandatory").sum())
 unique_agency_filtered = int(filtered["agency"].nunique())
 
@@ -484,8 +552,9 @@ k2.metric("Rows (Filtered)", f"{total_filtered:,}")
 k3.metric("Unique MS (All)", f"{unique_ms_all:,}")
 k4.metric("Unique MS (Filtered)", f"{unique_ms_filtered:,}")
 k5.metric("Unique TYPE (Filtered)", f"{unique_type_filtered:,}")
-k6.metric("Mandatory (Filtered)", f"{mandatory_filtered:,}")
-k7.metric("Agencies (Filtered)", f"{unique_agency_filtered:,}")
+k6.metric("Mandatory (All)", f"{mandatory_all:,}")
+k7.metric("Mandatory (Filtered)", f"{mandatory_filtered:,}")
+k8.metric("Agency Count (Filtered)", f"{unique_agency_filtered:,}")
 
 # -----------------------------
 # Charts
