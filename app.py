@@ -8,23 +8,16 @@ import streamlit as st
 APP_TITLE = "Malaysia Standards Dashboard (MS)"
 DB_PATH = Path("ms_dashboard.sqlite3")
 
+# Master file sheets
 DEFAULT_SHEET_MASTER = "MS Collection"
 DEFAULT_SHEET_NSC = "List of NSC"
-
-# Optional: sheet name in mandatory file (your uploaded file uses "LIST ")
-DEFAULT_SHEET_MANDATORY = "LIST "
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
 def parse_nsc(nsc_text: str):
-    """
-    Extract:
-      - nsc_code: 'NSC 05'
-      - nsc_no  : 5
-      - nsc_name: description after '-'
-    """
+    """Extract NSC_CODE (NSC 05), NSC_NO (5), NSC_NAME (text after '-')"""
     if pd.isna(nsc_text):
         return None, None, None
     s = str(nsc_text).strip()
@@ -37,18 +30,73 @@ def parse_nsc(nsc_text: str):
     return nsc_code, nsc_no, name
 
 
-def normalize_ms_no(x) -> str:
+def canonical_ms_code(x) -> str:
     """
-    Make matching robust across files:
-    - uppercase
-    - collapse spaces
-    - strip
+    Robust MS key extraction from messy strings (both master & mandatory files).
+    Example -> 'MS 1040:1986', 'MS 1742-2:2004', 'MS IEC 61851-21-1:2021'
     """
     if pd.isna(x):
         return ""
-    s = str(x).strip().upper()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    raw = str(x).upper().strip()
+
+    # remove bracketed notes
+    raw = re.sub(r"\(.*?\)", "", raw)
+    raw = raw.replace(",", " ")
+    raw = re.sub(r"\s+", " ", raw)
+    raw = re.sub(r"\s*-\s*", "-", raw)
+    raw = re.sub(r"\s*:\s*", ":", raw)
+
+    # Capture starting from MS up to a year (optional)
+    # Allows prefixes like "MS IEC", "MS ISO/IEC", etc.
+    pat = r"\bMS\b\s*(?:[A-Z/\.]{2,20}\s+)*[0-9A-Z][0-9A-Z./-]*(?:-[0-9A-Z./-]+)*(:\d{4})?"
+    m = re.search(pat, raw)
+    if not m:
+        return ""
+
+    code = m.group(0).strip()
+    code = re.sub(r"\bMS\b\s*", "MS ", code).strip()
+    code = re.sub(r"\s+", " ", code)
+
+    # If year missing in captured code but appears later in raw, append it
+    if not re.search(r":\d{4}\b", code):
+        y = re.search(r":(\d{4})\b", raw)
+        if y:
+            code = code + (y.group(1) if code.endswith(":") else f":{y.group(1)}")
+
+    return code
+
+
+def safe_get(df: pd.DataFrame, col: str):
+    return df[col] if col in df.columns else None
+
+
+def read_mandatory_sheet(excel_file) -> pd.DataFrame:
+    """
+    Auto-detect the sheet in mandatory file that contains 'No. of MS' column.
+    Also strips all column names.
+    """
+    try:
+        xls = pd.ExcelFile(excel_file)
+    except Exception:
+        return pd.DataFrame()
+
+    target = None
+    for sh in xls.sheet_names:
+        try:
+            df0 = pd.read_excel(excel_file, sheet_name=sh, nrows=5)
+        except Exception:
+            continue
+        cols = [str(c).strip() for c in df0.columns]
+        if any(c.lower() == "no. of ms" for c in cols):
+            target = sh
+            break
+
+    if target is None:
+        return pd.DataFrame()
+
+    mand = pd.read_excel(excel_file, sheet_name=target)
+    mand.columns = [str(c).strip() for c in mand.columns]  # IMPORTANT
+    return mand
 
 
 def connect_db():
@@ -73,7 +121,7 @@ def ensure_tables(conn: sqlite3.Connection):
             nsc_name TEXT,
             ms_new_old_number TEXT,
 
-            -- NEW (mandatory/voluntary + regulator info)
+            -- NEW: mandatory/voluntary + agency/regulator info
             compliance_type TEXT,
             agency TEXT,
             refer TEXT,
@@ -81,9 +129,13 @@ def ensure_tables(conn: sqlite3.Connection):
             regulation TEXT,
             directive_guideline TEXT,
             date_of_enforcement TEXT,
-            remarks_new_version TEXT
+            remarks_new_version TEXT,
+
+            -- internal matching key
+            ms_key TEXT,
+            ms_old_key TEXT
         )
-    """
+        """
     )
     cur.execute(
         """
@@ -95,14 +147,14 @@ def ensure_tables(conn: sqlite3.Connection):
             office_number TEXT,
             cfs TEXT
         )
-    """
+        """
     )
     conn.commit()
 
 
 def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_excel_file=None):
     """
-    Ingest master Excel + optional mandatory/regulator Excel into SQLite, replacing existing data.
+    Ingest master Excel + optional mandatory Excel into SQLite, replacing existing data.
     """
     master = pd.read_excel(master_excel_file, sheet_name=DEFAULT_SHEET_MASTER)
     nsc_dir = pd.read_excel(master_excel_file, sheet_name=DEFAULT_SHEET_NSC)
@@ -126,9 +178,12 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
     master["NSC_NO"] = parsed.apply(lambda x: x[1])
     master["NSC_NAME"] = parsed.apply(lambda x: x[2])
 
-    # --- NEW: Merge mandatory/regulator info (if file provided)
-    master["ms_norm"] = master["MS NUMBER"].apply(normalize_ms_no)
-    master["compliance_type"] = "Voluntary"  # default
+    # Build matching keys
+    master["ms_key"] = master["MS NUMBER"].apply(canonical_ms_code)
+    master["ms_old_key"] = master["MS NEW/OLD NUMBER"].apply(canonical_ms_code)
+
+    # Defaults
+    master["compliance_type"] = "Voluntary"
     master["agency"] = None
     master["refer"] = None
     master["act"] = None
@@ -137,48 +192,74 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
     master["date_of_enforcement"] = None
     master["remarks_new_version"] = None
 
+    # --- Merge mandatory info (if provided)
     if mandatory_excel_file is not None:
-        mand = pd.read_excel(mandatory_excel_file, sheet_name=DEFAULT_SHEET_MANDATORY)
+        mand = read_mandatory_sheet(mandatory_excel_file)
 
-        # Standardize expected columns from your file
-        # Columns in your uploaded mandatory file (LIST ):
-        # 'Refer', 'No. of MS', 'Agency', 'Act', 'Regulation \n', 'Directive / Circulars / Guideline',
-        # 'Date of Enforcement', 'Remarks / New Version'
-        mand = mand.copy()
-        mand["ms_norm"] = mand["No. of MS"].apply(normalize_ms_no)
+        if mand.empty or ("No. of MS" not in mand.columns):
+            st.warning("Mandatory file uploaded but cannot find column 'No. of MS' in any sheet.")
+        else:
+            mand = mand.copy()
+            mand["ms_key"] = mand["No. of MS"].apply(canonical_ms_code)
+            mand = mand[mand["ms_key"] != ""].copy()
 
-        # keep only rows with an MS number
-        mand = mand[mand["ms_norm"] != ""]
+            # Normalize possible weird regulation column name
+            reg_col = "Regulation \n" if "Regulation \n" in mand.columns else ("Regulation" if "Regulation" in mand.columns else None)
 
-        mand_out = pd.DataFrame(
-            {
-                "ms_norm": mand["ms_norm"],
-                "refer": mand.get("Refer"),
-                "agency": mand.get("Agency"),
-                "act": mand.get("Act"),
-                "regulation": mand.get("Regulation \n"),
-                "directive_guideline": mand.get("Directive / Circulars / Guideline"),
-                "date_of_enforcement": mand.get("Date of Enforcement"),
-                "remarks_new_version": mand.get("Remarks / New Version"),
-            }
-        ).drop_duplicates(subset=["ms_norm"], keep="first")
+            mand_out = pd.DataFrame(
+                {
+                    "ms_key": mand["ms_key"],
+                    "refer": safe_get(mand, "Refer"),
+                    "agency": safe_get(mand, "Agency"),
+                    "act": safe_get(mand, "Act"),
+                    "regulation": mand[reg_col] if reg_col else None,
+                    "directive_guideline": safe_get(mand, "Directive / Circulars / Guideline"),
+                    "date_of_enforcement": safe_get(mand, "Date of Enforcement"),
+                    "remarks_new_version": safe_get(mand, "Remarks / New Version"),
+                }
+            ).drop_duplicates(subset=["ms_key"], keep="first")
 
-        # left merge
-        merged = master.merge(mand_out, on="ms_norm", how="left", suffixes=("", "_mand"))
+            # 1) Match by current MS number
+            merged1 = master.merge(mand_out, on="ms_key", how="left", suffixes=("", "_m"))
 
-        # If matched -> Mandatory + fill fields
-        matched = merged["agency"].notna() | merged["act"].notna() | merged["regulation"].notna() | merged["refer"].notna()
-        merged.loc[matched, "compliance_type"] = "Mandatory"
+            # 2) Fallback match using old MS number (MS NEW/OLD NUMBER)
+            mand_out2 = mand_out.rename(columns={"ms_key": "ms_old_key"})
+            merged2 = merged1.merge(mand_out2, on="ms_old_key", how="left", suffixes=("", "_old"))
 
-        # copy merged back to master
-        master["compliance_type"] = merged["compliance_type"]
-        master["agency"] = merged["agency"]
-        master["refer"] = merged["refer"]
-        master["act"] = merged["act"]
-        master["regulation"] = merged["regulation"]
-        master["directive_guideline"] = merged["directive_guideline"]
-        master["date_of_enforcement"] = merged["date_of_enforcement"]
-        master["remarks_new_version"] = merged["remarks_new_version"]
+            # Combine: prefer direct match, else old match
+            def coalesce(a, b):
+                return a.where(a.notna(), b)
+
+            merged2["agency_final"] = coalesce(merged2["agency"], merged2.get("agency_old"))
+            merged2["refer_final"] = coalesce(merged2["refer"], merged2.get("refer_old"))
+            merged2["act_final"] = coalesce(merged2["act"], merged2.get("act_old"))
+            merged2["regulation_final"] = coalesce(merged2["regulation"], merged2.get("regulation_old"))
+            merged2["directive_guideline_final"] = coalesce(
+                merged2["directive_guideline"], merged2.get("directive_guideline_old")
+            )
+            merged2["date_of_enforcement_final"] = coalesce(
+                merged2["date_of_enforcement"], merged2.get("date_of_enforcement_old")
+            )
+            merged2["remarks_new_version_final"] = coalesce(
+                merged2["remarks_new_version"], merged2.get("remarks_new_version_old")
+            )
+
+            matched = (
+                merged2["agency_final"].notna()
+                | merged2["act_final"].notna()
+                | merged2["regulation_final"].notna()
+                | merged2["refer_final"].notna()
+            )
+            merged2.loc[matched, "compliance_type"] = "Mandatory"
+
+            master["compliance_type"] = merged2["compliance_type"]
+            master["agency"] = merged2["agency_final"]
+            master["refer"] = merged2["refer_final"]
+            master["act"] = merged2["act_final"]
+            master["regulation"] = merged2["regulation_final"]
+            master["directive_guideline"] = merged2["directive_guideline_final"]
+            master["date_of_enforcement"] = merged2["date_of_enforcement_final"]
+            master["remarks_new_version"] = merged2["remarks_new_version_final"]
 
     # Replace tables
     cur = conn.cursor()
@@ -200,8 +281,6 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
             "nsc_no": master["NSC_NO"],
             "nsc_name": master["NSC_NAME"],
             "ms_new_old_number": master["MS NEW/OLD NUMBER"],
-
-            # NEW fields
             "compliance_type": master["compliance_type"],
             "agency": master["agency"],
             "refer": master["refer"],
@@ -210,6 +289,8 @@ def load_excel_to_db(master_excel_file, conn: sqlite3.Connection, mandatory_exce
             "directive_guideline": master["directive_guideline"],
             "date_of_enforcement": master["date_of_enforcement"],
             "remarks_new_version": master["remarks_new_version"],
+            "ms_key": master["ms_key"],
+            "ms_old_key": master["ms_old_key"],
         }
     )
     master_out.to_sql("ms_master", conn, if_exists="append", index=False)
@@ -259,9 +340,7 @@ def read_nsc_dir(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def update_status(conn: sqlite3.Connection, updates: pd.DataFrame):
-    """
-    updates: DataFrame with columns row_id, ms_status
-    """
+    """updates: DataFrame with columns row_id, ms_status"""
     cur = conn.cursor()
     for _, r in updates.iterrows():
         cur.execute(
@@ -280,17 +359,15 @@ st.title(APP_TITLE)
 with st.sidebar:
     st.header("Data Source")
 
-    st.caption("1) Upload **Master List** Excel (contains MS Collection + List of NSC).")
+    st.caption("1) Upload **Master List** Excel (must contain sheets: MS Collection, List of NSC).")
     uploaded_master = st.file_uploader("Upload Master List (.xlsx)", type=["xlsx"], key="master")
 
-    st.caption("2) (Optional) Upload **Mandatory/Regulator** Excel (contains LIST sheet).")
+    st.caption("2) Upload **Mandatory/Agency** Excel (auto-detect sheet with column 'No. of MS').")
     uploaded_mand = st.file_uploader("Upload Mandatory List (.xlsx)", type=["xlsx"], key="mand")
 
     col_a, col_b = st.columns(2)
     with col_a:
-        do_refresh = st.button(
-            "Refresh DB", use_container_width=True, disabled=(uploaded_master is None)
-        )
+        do_refresh = st.button("Refresh DB", use_container_width=True, disabled=(uploaded_master is None))
     with col_b:
         reset = st.button("Reset App Cache", use_container_width=True)
 
@@ -308,14 +385,14 @@ if do_refresh and uploaded_master is not None:
     st.success("Database refreshed from uploaded Excel(s).")
 
 if not db_has_data():
-    st.warning("No data in the dashboard database yet. Upload the Master List Excel and click **Refresh DB**.")
+    st.warning("No data in the dashboard database yet. Upload Master List and click **Refresh DB**.")
     st.stop()
 
 master = read_master(conn)
 nsc_dir = read_nsc_dir(conn)
 
 # -----------------------------
-# Filters (NSC + Status + TYPE OF MS + Mandatory/Voluntary + Agency)
+# Filters
 # -----------------------------
 st.subheader("Filters")
 c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 2, 3, 3])
@@ -339,6 +416,8 @@ with c4:
 
 with c5:
     agency_opts = sorted([a for a in master["agency"].fillna("Unknown").unique().tolist()])
+    # Put real agencies first, keep Unknown last
+    agency_opts = [a for a in agency_opts if a != "Unknown"] + (["Unknown"] if "Unknown" in agency_opts else [])
     agency_sel = st.multiselect("Filter by Agency", options=agency_opts, default=[])
 
 with c6:
@@ -353,16 +432,12 @@ filtered["agency"] = filtered["agency"].fillna("Unknown")
 
 if nsc_sel:
     filtered = filtered[filtered["nsc_code"].isin(nsc_sel)]
-
 if status_sel:
     filtered = filtered[filtered["ms_status"].isin(status_sel)]
-
 if type_sel:
     filtered = filtered[filtered["type_of_ms"].isin(type_sel)]
-
 if comp_sel:
     filtered = filtered[filtered["compliance_type"].isin(comp_sel)]
-
 if agency_sel:
     filtered = filtered[filtered["agency"].isin(agency_sel)]
 
@@ -377,7 +452,7 @@ if search.strip():
 # KPIs
 # -----------------------------
 st.subheader("Key Metrics")
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
 
 total_all = int(master.shape[0])
 total_filtered = int(filtered.shape[0])
@@ -385,13 +460,15 @@ unique_ms_all = int(master["ms_number"].nunique())
 unique_ms_filtered = int(filtered["ms_number"].nunique())
 unique_type_filtered = int(filtered["type_of_ms"].nunique())
 mandatory_filtered = int((filtered["compliance_type"] == "Mandatory").sum())
+unique_agency_filtered = int(filtered["agency"].nunique())
 
 k1.metric("Rows (All)", f"{total_all:,}")
 k2.metric("Rows (Filtered)", f"{total_filtered:,}")
-k3.metric("Unique MS Number (All)", f"{unique_ms_all:,}")
-k4.metric("Unique MS Number (Filtered)", f"{unique_ms_filtered:,}")
-k5.metric("Unique TYPE OF MS (Filtered)", f"{unique_type_filtered:,}")
+k3.metric("Unique MS (All)", f"{unique_ms_all:,}")
+k4.metric("Unique MS (Filtered)", f"{unique_ms_filtered:,}")
+k5.metric("Unique TYPE (Filtered)", f"{unique_type_filtered:,}")
 k6.metric("Mandatory (Filtered)", f"{mandatory_filtered:,}")
+k7.metric("Agencies (Filtered)", f"{unique_agency_filtered:,}")
 
 # -----------------------------
 # Charts
@@ -424,11 +501,11 @@ with cc4:
     st.bar_chart(comp_counts.set_index("compliance_type"))
 
 # -----------------------------
-# NSC Directory (optional)
+# NSC Directory
 # -----------------------------
 with st.expander("NSC Directory (Project Manager / Contacts)", expanded=False):
     if nsc_dir.empty:
-        st.info("NSC directory not found in the uploaded file.")
+        st.info("NSC directory not found in the uploaded master file.")
     else:
         show_dir = nsc_dir.copy()
         if nsc_sel:
@@ -450,17 +527,16 @@ display_cols = [
     "ms_status",
     "compliance_type",
     "agency",
-    "nsc_code",
-    "nsc_name",
-    "pages",
-    "price_rm",
-    "ms_new_old_number",
-    # optional: show more regulator fields when needed
     "act",
     "regulation",
     "directive_guideline",
     "date_of_enforcement",
     "remarks_new_version",
+    "nsc_code",
+    "nsc_name",
+    "pages",
+    "price_rm",
+    "ms_new_old_number",
 ]
 
 table = filtered[display_cols].copy()
@@ -468,7 +544,7 @@ table = filtered[display_cols].copy()
 if not edit_mode:
     st.dataframe(table, use_container_width=True, hide_index=True)
 else:
-    st.info("Edit **MS Status** and click **Save changes**. Changes are stored in the local SQLite database.")
+    st.info("Edit **MS Status** and click **Save changes**. Changes are stored in local SQLite.")
     edited = st.data_editor(
         table,
         use_container_width=True,
